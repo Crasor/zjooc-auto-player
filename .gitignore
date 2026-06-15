@@ -1,8 +1,8 @@
 # 登录会话（含 Cookie）
 auth_state.json
 
-# 配置文件（含账号密码）
-config.yaml
+# 真实配置文件（含账号密码 — 不提交）
+config.local.yaml
 
 # Python
 __pycache__/
