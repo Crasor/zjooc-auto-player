@@ -1,0 +1,21 @@
+# 登录会话（含 Cookie）
+auth_state.json
+
+# 配置文件（含账号密码）
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 验证码截图
+captcha.png
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+Thumbs.db
+.DS_Store
