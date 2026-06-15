@@ -1,265 +1,210 @@
 """
-核心状态机模块（基于真实 DOM 重写）
-
-状态流转:
-  IDLE → 检测内容类型
-    → VIDEO_PLAYING (有视频)
-    → DOCUMENT_READING (图文)
-    → QUIZ_WAITING (测验)
-  VIDEO_PLAYING → 播放完成 → NEXT_SUBTAB → 尝试节内下一个子标签
-  NEXT_SECTION → 尝试侧栏下一节
-  NAVIGATING → 等待加载 → IDLE
-  FINISHED → 全部完成
-
-关键变化：节内可能有多个子标签 (sub-tabs)，需要逐个播放
+核心状态机 v2.3
+精简逻辑：
+  进入时 → 跳过已完成 → 播视频 → 播完点下一个 → 本节没了去下一节 → 全部完成退出
+  只有跨节时才回 notice 点「继续学习」
 """
 
 import asyncio
 from enum import Enum
 from datetime import datetime
-
 from playwright.async_api import Page
-
 from src.player import PlayerController
 from src.navigator import Navigator, SectionType
 from src.anti_detect import AntiDetect
+from src.progress import ProgressBar, console
 
 
 class State(Enum):
     IDLE = "idle"
     VIDEO_PLAYING = "video_playing"
-    DOCUMENT_READING = "document_reading"
-    QUIZ_WAITING = "quiz_waiting"
-    NEXT_SUBTAB = "next_subtab"
-    NEXT_SECTION = "next_section"
-    NAVIGATING = "navigating"
+    SKIP_TO_NEXT = "skip_to_next"     # 跳过已完成 → 找下一个未完成
+    GOTO_NEXT_SECTION = "goto_next_section"  # 本节全部完成，回 notice 跳下一节
     FINISHED = "finished"
 
 
 class ZjoocStateMachine:
-    """在浙学刷课状态机 v2.0"""
 
-    def __init__(
-        self,
-        page: Page,
-        speed: float = 2.0,
-        mute: bool = True,
-        poll_interval: float = 3.0,
-        enable_anti_detect: bool = True,
-        mouse_interval: float = 30.0,
-    ):
+    def __init__(self, page: Page, notice_url: str = "",
+                 speed: float = 2.0, mute: bool = True,
+                 poll_interval: float = 3.0,
+                 enable_anti_detect: bool = True, mouse_interval: float = 30.0):
         self.page = page
+        self.notice_url = notice_url
         self.state = State.IDLE
         self.poll_interval = poll_interval
         self.speed = speed
         self.mute = mute
-
         self.player = PlayerController(page, speed=speed, mute=mute)
         self.navigator = Navigator(page)
         self.anti_detect = AntiDetect(
-            page,
-            enable_mouse_sim=enable_anti_detect,
-            mouse_interval=mouse_interval,
-            speed=speed,
-            mute=mute,
-        )
-
-        self.stats = {
-            "videos_watched": 0,
-            "documents_read": 0,
-            "start_time": None,
-        }
-
+            page, enable_mouse_sim=enable_anti_detect,
+            mouse_interval=mouse_interval, speed=speed, mute=mute)
+        self.stats = {"videos_watched": 0, "start_time": None}
         self._on_state_change = None
         self._on_progress_update = None
-        self._retry_count = 0
-        self._max_retries = 5
+        self._section_name = ""
 
-    def on_state_change(self, callback):
-        self._on_state_change = callback
+    def on_state_change(self, cb): self._on_state_change = cb
+    def on_progress_update(self, cb): self._on_progress_update = cb
 
-    def on_progress_update(self, callback):
-        self._on_progress_update = callback
-
-    async def _set_state(self, new_state: State):
+    async def _set_state(self, s: State):
         old = self.state
-        self.state = new_state
-        if old != new_state:
-            print(f"[状态] {old.value} → {new_state.value}")
+        self.state = s
+        if old != s:
+            console.newline()
+            print(f"[状态] {old.value} → {s.value}")
             if self._on_state_change:
-                await self._on_state_change(new_state.value)
-
-    async def _notify_progress(self, current: float, duration: float):
-        pct = (current / duration * 100) if duration > 0 else 0
-        if self._on_progress_update:
-            await self._on_progress_update(current, duration, pct)
+                await self._on_state_change(s.value)
 
     # ========= 主循环 =========
 
     async def run(self):
         self.stats["start_time"] = datetime.now()
         await self.anti_detect.start()
+        print(f"[状态机] 启动")
 
-        print(f"\n[状态机] 启动，轮询间隔: {self.poll_interval}s")
+        # 进入时先检查当前是否已完成
+        if await self.navigator.is_current_completed():
+            print("[状态机] 当前已完成，跳过")
+            await self._set_state(State.SKIP_TO_NEXT)
 
         while self.state != State.FINISHED:
             try:
                 await self._tick()
             except Exception as e:
                 print(f"[状态机] 异常: {e}")
-                self._retry_count += 1
-                if self._retry_count > self._max_retries:
-                    print("[状态机] 重试次数过多，跳过当前节")
-                    await self._set_state(State.NEXT_SECTION)
-                    self._retry_count = 0
                 await asyncio.sleep(self.poll_interval)
 
         await self.anti_detect.stop()
         elapsed = datetime.now() - self.stats["start_time"]
-        print(f"\n[状态机] 🎉 课程全部完成！")
-        print(f"  视频: {self.stats['videos_watched']} | 图文: {self.stats['documents_read']}")
-        print(f"  耗时: {elapsed}")
+        print(f"\n{'='*50}\n  全部完成！视频: {self.stats['videos_watched']} | 耗时: {elapsed}\n{'='*50}")
 
     async def _tick(self):
         if self.state == State.IDLE:
-            await self._handle_idle()
+            await self._idle()
         elif self.state == State.VIDEO_PLAYING:
-            await self._handle_video_playing()
-        elif self.state == State.DOCUMENT_READING:
-            await self._handle_document_reading()
-        elif self.state == State.QUIZ_WAITING:
-            await self._handle_quiz_waiting()
-        elif self.state == State.NEXT_SUBTAB:
-            await self._handle_next_subtab()
-        elif self.state == State.NEXT_SECTION:
-            await self._handle_next_section()
-        elif self.state == State.NAVIGATING:
-            await self._handle_navigating()
-
+            await self._playing()
+        elif self.state == State.SKIP_TO_NEXT:
+            await self._skip_to_next()
+        elif self.state == State.GOTO_NEXT_SECTION:
+            await self._goto_next_section()
         await asyncio.sleep(self.poll_interval)
 
     # ========= IDLE =========
 
-    async def _handle_idle(self):
-        """等待页面加载，检测内容类型"""
-        section_type = await self.navigator.detect_section_type()
+    async def _idle(self):
+        if await self.navigator.is_current_completed():
+            await self._set_state(State.SKIP_TO_NEXT)
+            return
 
-        if section_type == SectionType.VIDEO:
-            has_video = await self.player.wait_for_video(timeout=8.0)
-            if has_video:
-                await self.player.set_mute(self.mute)
-                await self.player.set_speed(self.speed)
-                await self.player.play()
-                self._retry_count = 0
-                await self._set_state(State.VIDEO_PLAYING)
-            else:
-                print("[IDLE] 未检测到视频，等待中...")
-        elif section_type == SectionType.DOCUMENT:
-            await self._set_state(State.DOCUMENT_READING)
-        elif section_type == SectionType.QUIZ:
-            await self._set_state(State.QUIZ_WAITING)
+        if await self.player.wait_for_video(timeout=6.0):
+            await self.player.set_mute(self.mute)
+            await self.player.set_speed(self.speed)
+            await self.player.play()
+            sec = await self.navigator.get_current_section()
+            self._section_name = sec.get("title", "") if sec else ""
+            await self._set_state(State.VIDEO_PLAYING)
+        elif await self.navigator.detect_section_type() == SectionType.DOCUMENT:
+            await self.navigator.handle_document_section()
+            await asyncio.sleep(3)
+            await self._set_state(State.SKIP_TO_NEXT)
         else:
-            print("[IDLE] 类型未知，等待加载...")
-            await self.navigator.wait_for_page_ready(timeout=5.0)
+            await asyncio.sleep(2)
 
     # ========= VIDEO_PLAYING =========
 
-    async def _handle_video_playing(self):
-        """监控视频播放进度"""
-        state = await self.player.ensure_playing()
-        if not state.get("ok"):
+    async def _playing(self):
+        st = await self.player.ensure_playing()
+        if not st.get("ok"):
             await self._set_state(State.IDLE)
             return
 
-        progress = await self.player.get_progress()
+        p = await self.player.get_progress()
+        if p and p.duration > 0:
+            bar = ProgressBar.draw(p.percent)
+            c = ProgressBar.format_time(p.current)
+            d = ProgressBar.format_time(p.duration)
+            parts = self._section_name.split(" > ")
+            name = parts[-1] if parts else self._section_name
+            if len(name) > 18: name = name[:16] + ".."
+            console.print(f"  {name}  {bar}  {c}/{d}  #{self.stats['videos_watched']+1}")
 
-        if progress and progress.duration > 0:
-            await self._notify_progress(progress.current, progress.duration)
-            print(f"[播放] {progress.current:.0f}s / {progress.duration:.0f}s ({progress.percent:.0f}%)")
-
-            if progress.is_finished:
+            if p.is_finished:
                 self.stats["videos_watched"] += 1
-                await self._set_state(State.NEXT_SUBTAB)
+                console.newline()
+                await self._set_state(State.SKIP_TO_NEXT)
         else:
-            # 无法读取进度，可能视频还没加载
-            print(f"[播放] 等待视频加载...")
+            console.print(f"  {self._section_name[:20]}  [加载...]")
 
-    # ========= DOCUMENT =========
+    # ========= SKIP_TO_NEXT（直接在当前页找下一个未完成） =========
 
-    async def _handle_document_reading(self):
-        """处理图文"""
-        result = await self.navigator.handle_document_section()
-        self.stats["documents_read"] += 1
-        print(f"[图文] {'已点击完成按钮' if result.get('clicked') else '已滚动到底部'}")
-        await asyncio.sleep(3)
-        await self._set_state(State.NEXT_SUBTAB)
+    async def _skip_to_next(self):
+        """
+        先尝试点下一个子标签；本节没了就 GOTO_NEXT_SECTION
+        """
+        # 先试子标签
+        subtabs = await self.navigator.get_subtabs()
+        if subtabs:
+            active_idx = -1
+            for i, t in enumerate(subtabs):
+                if t.get("isActive"):
+                    active_idx = i
+                    break
 
-    # ========= QUIZ =========
+            # 往后找第一个未完成的
+            for i in range(active_idx + 1, len(subtabs)):
+                if not subtabs[i].get("isCompleted"):
+                    await self.page.evaluate(f"""
+                        () => {{ const tabs = document.querySelectorAll('.plan-detailvideo .el-tabs__item.is-top');
+                                 if (tabs[{i}]) tabs[{i}].click(); }}
+                    """)
+                    print(f"[跳过] → {subtabs[i]['label']}")
+                    await asyncio.sleep(3)
+                    await self._set_state(State.IDLE)
+                    return
 
-    async def _handle_quiz_waiting(self):
-        """测验需人工处理"""
-        await self.navigator.handle_quiz_section()
-        await self._set_state(State.NEXT_SUBTAB)
+        # 本节子标签全完成了 → 跨节
+        await self._set_state(State.GOTO_NEXT_SECTION)
 
-    # ========= NEXT_SUBTAB =========
+    # ========= GOTO_NEXT_SECTION（回 notice 点继续学习） =========
 
-    async def _handle_next_subtab(self):
-        """尝试导航到节内下一个子标签"""
-        result = await self.navigator.click_next_subtab()
-
-        if result.success:
-            print(f"[子标签] 跳转: {result.reason}")
-            await self._set_state(State.NAVIGATING)
-        else:
-            # 当前节无更多子标签 → 尝试下一节
-            print("[子标签] 本节无更多子标签 → 尝试下一节")
-            await self._set_state(State.NEXT_SECTION)
-
-    # ========= NEXT_SECTION =========
-
-    async def _handle_next_section(self):
-        """导航到侧栏的下一节"""
-        result = await self.navigator.click_next_section()
-
-        if result.finished:
-            print("[导航] 全部章节完成！")
+    async def _goto_next_section(self):
+        if not self.notice_url:
             await self._set_state(State.FINISHED)
-        elif result.success:
-            print(f"[导航] 跳转: {result.reason}")
-            await self._set_state(State.NAVIGATING)
-        else:
-            print(f"[导航] 未知状态: {result.reason}")
-            await asyncio.sleep(2)
+            return
 
-    # ========= NAVIGATING =========
+        print("[跨节] 回公告页点继续学习...")
+        await self.page.goto(self.notice_url, wait_until="networkidle")
+        await asyncio.sleep(2)
 
-    async def _handle_navigating(self):
-        """等待页面加载"""
-        ready = await self.navigator.wait_for_page_ready(timeout=10.0)
-        if ready:
-            await AntiDetect.inject_visibility_override(self.page)
-            await AntiDetect.inject_autoplay_unlock(self.page)
-            await asyncio.sleep(2)
-            await self._set_state(State.IDLE)
-        else:
-            print("[跳转] 页面加载超时，继续等待...")
+        clicked = await self.page.evaluate("""
+            () => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    if (b.innerText?.trim() === '继续学习') { b.click(); return true; }
+                }
+                return false;
+            }
+        """)
+        if not clicked:
+            await self._set_state(State.FINISHED)
+            return
 
-    # ========= 控制接口 =========
+        await asyncio.sleep(5)
+        await AntiDetect.inject_visibility_override(self.page)
+
+        # 再跳过本节内已完成的子标签
+        await self._set_state(State.SKIP_TO_NEXT)
+
+    # ========= 控制 =========
 
     async def pause_automation(self):
-        print("[控制] 暂停自动化")
-        await self.player.page.evaluate("() => { const v = document.querySelector('video'); if (v) v.pause(); }")
-
+        console.newline()
+        print("[控制] 暂停")
     async def resume_automation(self):
-        print("[控制] 恢复自动化")
         await self._set_state(State.IDLE)
-
-    async def set_speed(self, speed: float):
-        self.speed = speed
-        self.anti_detect.speed = speed
-        await self.player.set_speed(speed)
-
-    async def set_mute(self, mute: bool):
-        self.mute = mute
-        self.anti_detect.mute = mute
-        await self.player.set_mute(mute)
+    async def set_speed(self, s: float):
+        self.speed = s; self.anti_detect.speed = s; await self.player.set_speed(s)
+    async def set_mute(self, m: bool):
+        self.mute = m; self.anti_detect.mute = m; await self.player.set_mute(m)

@@ -1,0 +1,12 @@
+# ===========================================
+# ZJOOC 刷课助手 — 配置文件
+# ===========================================
+
+playback:
+  speed: 2.0            # 播放倍速 (0.5 ~ 16)
+  mute: true            # 是否静音播放
+  poll_interval: 3      # 状态轮询间隔（秒）
+
+anti_detect:
+  simulate_activity: true      # 模拟用户鼠标活动
+  activity_interval: 30        # 模拟活动间隔（秒）
