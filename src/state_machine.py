@@ -95,7 +95,8 @@ class ZjoocStateMachine:
 
     async def _idle(self):
         if await self.navigator.is_current_completed():
-            await self._set_state(State.SKIP_TO_NEXT)
+            # 一次性连续跳过所有已完成，不用反复状态切换
+            await self._fast_skip_completed()
             return
 
         if await self.player.wait_for_video(timeout=6.0):
@@ -112,15 +113,73 @@ class ZjoocStateMachine:
         else:
             await asyncio.sleep(2)
 
+    async def _fast_skip_completed(self):
+        """一次性连续跳过所有已完成，直到找到未完成或全部结束"""
+        seen = set()  # 防循环：记录已访问位置
+        for _ in range(50):
+            # 记录当前位置
+            subtabs = await self.navigator.get_subtabs()
+            names = tuple(t.get("label", "") for t in (subtabs or []))
+            if names in seen:
+                print("[快速跳过] 检测到循环，全部完成")
+                break
+            seen.add(names)
+
+            # 找未完成的子标签
+            if subtabs:
+                for t in subtabs:
+                    if t.get("isActive"):
+                        continue
+                    if not t.get("isCompleted"):
+                        idx = t["index"]
+                        await self.page.evaluate(f"""
+                            () => {{ const tabs = document.querySelectorAll('.plan-detailvideo .el-tabs__item.is-top');
+                                     if (tabs[{idx}]) tabs[{idx}].click(); }}
+                        """)
+                        print(f"[快速跳过] → {t['label']}")
+                        await asyncio.sleep(2)
+                        await self._set_state(State.IDLE)
+                        return
+
+            # 子标签全完，试跨节
+            result = await self.navigator.click_next_section()
+            if result.finished:
+                break
+            if result.success:
+                print(f"[快速跳过] 跳节: {result.reason}")
+                await asyncio.sleep(3)
+                continue
+            # 无法跳 → 回 notice
+            if self.notice_url:
+                await self.page.goto(self.notice_url, wait_until="networkidle")
+                await asyncio.sleep(2)
+                await self.page.evaluate("""
+                    () => { const btns = document.querySelectorAll('button');
+                            for (const b of btns) { if (b.innerText?.trim()==='继续学习') { b.click(); return; } } }
+                """)
+                await asyncio.sleep(5)
+                continue
+            break
+
+        await self._set_state(State.FINISHED)
+
     # ========= VIDEO_PLAYING =========
 
     async def _playing(self):
+        # 先查进度，防止 ensure_playing 覆盖已结束状态
+        p = await self.player.get_progress()
+        if p and p.is_finished:
+            self.stats["videos_watched"] += 1
+            console.newline()
+            await self._set_state(State.SKIP_TO_NEXT)
+            return
+
         st = await self.player.ensure_playing()
         if not st.get("ok"):
             await self._set_state(State.IDLE)
             return
 
-        p = await self.player.get_progress()
+        p = await self.player.get_progress()  # 更新进度
         if p and p.duration > 0:
             bar = ProgressBar.draw(p.percent)
             c = ProgressBar.format_time(p.current)
@@ -164,17 +223,27 @@ class ZjoocStateMachine:
                     await self._set_state(State.IDLE)
                     return
 
-        # 本节子标签全完成了 → 跨节
-        await self._set_state(State.GOTO_NEXT_SECTION)
+        # 本节子标签全完成了 → 尝试侧栏跳转到下一节
+        result = await self.navigator.click_next_section()
+        if result.finished:
+            print("[跳过] 全部章节完成！")
+            await self._set_state(State.FINISHED)
+        elif result.success:
+            print(f"[跳过] 跳转下一节: {result.reason}, 跳过 {result.skipped} 个已完成")
+            await asyncio.sleep(3)
+            await self._set_state(State.IDLE)
+        else:
+            # 侧栏不可用 → 回 notice 点继续学习
+            await self._set_state(State.GOTO_NEXT_SECTION)
 
-    # ========= GOTO_NEXT_SECTION（回 notice 点继续学习） =========
+    # ========= GOTO_NEXT_SECTION（回 notice 点继续学习，兜底方案） =========
 
     async def _goto_next_section(self):
         if not self.notice_url:
             await self._set_state(State.FINISHED)
             return
 
-        print("[跨节] 回公告页点继续学习...")
+        print("[跨节] 侧栏不可用，回公告页点继续学习...")
         await self.page.goto(self.notice_url, wait_until="networkidle")
         await asyncio.sleep(2)
 
@@ -194,7 +263,16 @@ class ZjoocStateMachine:
         await asyncio.sleep(5)
         await AntiDetect.inject_visibility_override(self.page)
 
-        # 再跳过本节内已完成的子标签
+        # 检查是否所有子标签都已完成（防死循环）
+        subtabs = await self.navigator.get_subtabs()
+        all_done = all(t.get("isCompleted") for t in subtabs) if subtabs else True
+        if all_done:
+            # 尝试侧栏导航判断是否真的全完
+            result = await self.navigator.click_next_section()
+            if result.finished:
+                await self._set_state(State.FINISHED)
+                return
+
         await self._set_state(State.SKIP_TO_NEXT)
 
     # ========= 控制 =========

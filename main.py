@@ -11,6 +11,7 @@ ZJOOC 刷课助手 v2.1 — 主入口
 
 import argparse
 import asyncio
+import logging
 import signal
 import sys
 from datetime import datetime
@@ -25,6 +26,29 @@ from src.state_machine import ZjoocStateMachine
 from src.panel import ControlPanel
 
 ROOT_DIR = Path(__file__).parent
+
+
+def setup_logging():
+    """同时输出到终端和日志文件"""
+    log_path = ROOT_DIR / "runtime.log"
+    # 每次运行覆盖旧日志
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"ZJOOC 刷课助手日志 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*50}\n")
+
+    class TeeWriter:
+        def __init__(self, *files):
+            self.files = files
+        def write(self, text):
+            for f in self.files:
+                f.write(text)
+                f.flush()
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    log_file = open(log_path, "a", encoding="utf-8")
+    sys.stdout = TeeWriter(sys.stdout, log_file)
+    sys.stderr = TeeWriter(sys.stderr, log_file)
 
 
 def load_config(config_path: Path | None = None) -> dict:
@@ -135,6 +159,7 @@ async def panel_updater(panel, state_machine, stop_event):
 
 
 async def main():
+    setup_logging()
     args = parse_args()
     config = load_config(args.config)
     config = merge_config(config, args)

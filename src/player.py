@@ -109,12 +109,7 @@ class PlayerController:
                     if (p) p.catch(() => {});
                 }
 
-                // 如果视频已结束，尝试重播
-                if (v.ended) {
-                    v.currentTime = 0;
-                    const p = v.play();
-                    if (p) p.catch(() => {});
-                }
+                // 如果视频已结束，不重播（由状态机处理跳转）
 
                 // 确保设置生效
                 v.muted = true;
