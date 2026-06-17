@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZJOOC 刷课助手 v2.1 — 主入口
+ZJOOC 刷课助手 v2.3 — 主入口
 用法:
     python main.py                      # 智能模式（有Cookie→无头，无Cookie→有头）
     python main.py --headless           # 强制无头（无头验证码登录）
@@ -62,7 +62,7 @@ def load_config(config_path: Path | None = None) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="ZJOOC 在浙学刷课助手 v2.1",
+        description="ZJOOC 在浙学刷课助手 v2.3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -181,7 +181,7 @@ async def main():
 
     # ========= 启动信息 =========
     print("=" * 50)
-    print("  ZJOOC 在浙学刷课助手 v2.1")
+    print("  ZJOOC 在浙学刷课助手 v2.3")
     print("=" * 50)
     print(f"  倍速: {speed}x  |  静音: {'是' if mute else '否'}")
     print(f"  浏览器: {'无头' if headless else '可见'} ({headless_reason})")

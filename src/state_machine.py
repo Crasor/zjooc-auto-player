@@ -40,10 +40,12 @@ class ZjoocStateMachine:
         self.anti_detect = AntiDetect(
             page, enable_mouse_sim=enable_anti_detect,
             mouse_interval=mouse_interval, speed=speed, mute=mute)
-        self.stats = {"videos_watched": 0, "start_time": None}
+        self.stats = {"videos_watched": 0, "documents_read": 0, "start_time": None}
         self._on_state_change = None
         self._on_progress_update = None
         self._section_name = ""
+        self._watched_subtabs: set = set()  # 全局已刷视频 (完整路径)
+        self._seen_sections: set = set()     # _fast_skip_completed 防循环 (章节位置)
 
     def on_state_change(self, cb): self._on_state_change = cb
     def on_progress_update(self, cb): self._on_progress_update = cb
@@ -99,12 +101,18 @@ class ZjoocStateMachine:
             await self._fast_skip_completed()
             return
 
+        # 检查当前 subtab 是否已刷过（防止绕回已刷视频）
+        sec = await self.navigator.get_current_section()
+        section_name = sec.get("title", "") if sec else ""
+        if section_name and section_name in self._watched_subtabs:
+            print(f"[入口] 已刷过: {section_name}，跳过")
+            await self._fast_skip_completed()
+            return
+
         if await self.player.wait_for_video(timeout=6.0):
             await self.player.set_mute(self.mute)
             await self.player.set_speed(self.speed)
-            await self.player.play()
-            sec = await self.navigator.get_current_section()
-            self._section_name = sec.get("title", "") if sec else ""
+            self._section_name = section_name
             await self._set_state(State.VIDEO_PLAYING)
         elif await self.navigator.detect_section_type() == SectionType.DOCUMENT:
             await self.navigator.handle_document_section()
@@ -114,34 +122,56 @@ class ZjoocStateMachine:
             await asyncio.sleep(2)
 
     async def _fast_skip_completed(self):
-        """一次性连续跳过所有已完成，直到找到未完成或全部结束"""
-        seen = set()  # 防循环：记录已访问位置
+        """一次性连续跳过所有已完成，直到找到未完成或全部结束
+        使用全局 _seen_sections 和 _watched_subtabs 防止循环重播"""
+        self._seen_sections.clear()  # 每次调用重置
         for _ in range(50):
-            # 记录当前位置
-            subtabs = await self.navigator.get_subtabs()
-            names = tuple(t.get("label", "") for t in (subtabs or []))
-            if names in seen:
-                print("[快速跳过] 检测到循环，全部完成")
+            # 获取当前位置标识（用于防循环）
+            pos = await self.navigator.get_current_position()
+            pos_key = f"{pos['chapterIndex']}:{pos['sectionIndex']}" if pos else "unknown"
+            if pos_key in self._seen_sections:
+                print(f"[快速跳过] 检测到循环 ({pos_key})，全部完成")
                 break
-            seen.add(names)
+            self._seen_sections.add(pos_key)
 
-            # 找未完成的子标签
+            # 获取当前节名（用于拼 watcher key）
+            sec = await self.navigator.get_current_section()
+            section_title = sec.get("title", "") if sec else ""
+            # 去掉子标签部分，保留 "章 > 节"
+            parts = section_title.split(" > ")
+            section_prefix = " > ".join(parts[:2]) if len(parts) >= 2 else section_title
+
+            subtabs = await self.navigator.get_subtabs()
+
+            # 找未完成且未刷过的子标签
             if subtabs:
+                has_unwatched = False
                 for t in subtabs:
                     if t.get("isActive"):
                         continue
-                    if not t.get("isCompleted"):
-                        idx = t["index"]
-                        await self.page.evaluate(f"""
-                            () => {{ const tabs = document.querySelectorAll('.plan-detailvideo .el-tabs__item.is-top');
-                                     if (tabs[{idx}]) tabs[{idx}].click(); }}
-                        """)
-                        print(f"[快速跳过] → {t['label']}")
-                        await asyncio.sleep(2)
-                        await self._set_state(State.IDLE)
-                        return
+                    if t.get("isCompleted"):
+                        continue
+                    # 构建完整 key 检查是否已刷过
+                    full_key = f"{section_prefix} > {t['label']}"
+                    if full_key in self._watched_subtabs:
+                        continue  # 已刷过，跳过
+                    # 找到未完成且未刷过的！
+                    has_unwatched = True
+                    idx = t["index"]
+                    await self.page.evaluate(f"""
+                        () => {{ const tabs = document.querySelectorAll('.plan-detailvideo .el-tabs__item.is-top');
+                                 if (tabs[{idx}]) tabs[{idx}].click(); }}
+                    """)
+                    print(f"[快速跳过] → {t['label']}")
+                    await asyncio.sleep(2)
+                    await self._set_state(State.IDLE)
+                    return
 
-            # 子标签全完，试跨节
+                if has_unwatched:
+                    # 理论上不会到这里（上面已 return），但安全处理
+                    pass
+
+            # 子标签全完成或全刷过 → 跨节
             result = await self.navigator.click_next_section()
             if result.finished:
                 break
@@ -170,6 +200,7 @@ class ZjoocStateMachine:
         p = await self.player.get_progress()
         if p and p.is_finished:
             self.stats["videos_watched"] += 1
+            self._watched_subtabs.add(self._section_name)
             console.newline()
             await self._set_state(State.SKIP_TO_NEXT)
             return
@@ -191,6 +222,7 @@ class ZjoocStateMachine:
 
             if p.is_finished:
                 self.stats["videos_watched"] += 1
+                self._watched_subtabs.add(self._section_name)
                 console.newline()
                 await self._set_state(State.SKIP_TO_NEXT)
         else:
@@ -202,6 +234,12 @@ class ZjoocStateMachine:
         """
         先尝试点下一个子标签；本节没了就 GOTO_NEXT_SECTION
         """
+        # 获取当前节名前缀（用于 watcher key）
+        sec = await self.navigator.get_current_section()
+        section_title = sec.get("title", "") if sec else ""
+        parts = section_title.split(" > ")
+        section_prefix = " > ".join(parts[:2]) if len(parts) >= 2 else section_title
+
         # 先试子标签
         subtabs = await self.navigator.get_subtabs()
         if subtabs:
@@ -211,17 +249,21 @@ class ZjoocStateMachine:
                     active_idx = i
                     break
 
-            # 往后找第一个未完成的
+            # 往后找第一个未完成且未刷过的
             for i in range(active_idx + 1, len(subtabs)):
-                if not subtabs[i].get("isCompleted"):
-                    await self.page.evaluate(f"""
-                        () => {{ const tabs = document.querySelectorAll('.plan-detailvideo .el-tabs__item.is-top');
-                                 if (tabs[{i}]) tabs[{i}].click(); }}
-                    """)
-                    print(f"[跳过] → {subtabs[i]['label']}")
-                    await asyncio.sleep(3)
-                    await self._set_state(State.IDLE)
-                    return
+                if subtabs[i].get("isCompleted"):
+                    continue
+                full_key = f"{section_prefix} > {subtabs[i]['label']}"
+                if full_key in self._watched_subtabs:
+                    continue  # 已刷过
+                await self.page.evaluate(f"""
+                    () => {{ const tabs = document.querySelectorAll('.plan-detailvideo .el-tabs__item.is-top');
+                             if (tabs[{i}]) tabs[{i}].click(); }}
+                """)
+                print(f"[跳过] → {subtabs[i]['label']}")
+                await asyncio.sleep(3)
+                await self._set_state(State.IDLE)
+                return
 
         # 本节子标签全完成了 → 尝试侧栏跳转到下一节
         result = await self.navigator.click_next_section()
@@ -263,10 +305,24 @@ class ZjoocStateMachine:
         await asyncio.sleep(5)
         await AntiDetect.inject_visibility_override(self.page)
 
-        # 检查是否所有子标签都已完成（防死循环）
+        # 检查是否所有子标签都已完成或已刷过（防死循环）
         subtabs = await self.navigator.get_subtabs()
-        all_done = all(t.get("isCompleted") for t in subtabs) if subtabs else True
-        if all_done:
+        sec = await self.navigator.get_current_section()
+        section_title = sec.get("title", "") if sec else ""
+        parts = section_title.split(" > ")
+        section_prefix = " > ".join(parts[:2]) if len(parts) >= 2 else section_title
+
+        all_handled = True
+        if subtabs:
+            for t in subtabs:
+                if t.get("isCompleted"):
+                    continue
+                full_key = f"{section_prefix} > {t['label']}"
+                if full_key not in self._watched_subtabs:
+                    all_handled = False
+                    break
+
+        if all_handled:
             # 尝试侧栏导航判断是否真的全完
             result = await self.navigator.click_next_section()
             if result.finished:
